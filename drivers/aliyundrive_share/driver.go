@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Xhofe/rateg"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
@@ -52,8 +53,14 @@ func (d *AliyundriveShare) Init(ctx context.Context) error {
 			log.Errorf("%+v", err)
 		}
 	})
-	d.limitList = utils.LimitRateCtx(d.list, time.Second/4)
-	d.limitLink = utils.LimitRateCtx(d.link, time.Second)
+	d.limitList = rateg.LimitFnCtx(d.list, rateg.LimitFnOption{
+		Limit:  4,
+		Bucket: 1,
+	})
+	d.limitLink = rateg.LimitFnCtx(d.link, rateg.LimitFnOption{
+		Limit:  1,
+		Bucket: 1,
+	})
 	return nil
 }
 
@@ -98,7 +105,7 @@ func (d *AliyundriveShare) link(ctx context.Context, file model.Obj) (*model.Lin
 		"share_id":   d.ShareId,
 	}
 	var resp ShareLinkResp
-	_, err := d.request("https://api.aliyundrive.com/v2/file/get_share_link_download_url", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request("https://api.alipan.com/v2/file/get_share_link_download_url", http.MethodPost, func(req *resty.Request) {
 		req.SetHeader(CanaryHeaderKey, CanaryHeaderValue).SetBody(data).SetResult(&resp)
 	})
 	if err != nil {
@@ -106,7 +113,7 @@ func (d *AliyundriveShare) link(ctx context.Context, file model.Obj) (*model.Lin
 	}
 	return &model.Link{
 		Header: http.Header{
-			"Referer": []string{"https://www.aliyundrive.com/"},
+			"Referer": []string{"https://www.alipan.com/"},
 		},
 		URL: resp.DownloadUrl,
 	}, nil
@@ -121,9 +128,9 @@ func (d *AliyundriveShare) Other(ctx context.Context, args model.OtherArgs) (int
 	}
 	switch args.Method {
 	case "doc_preview":
-		url = "https://api.aliyundrive.com/v2/file/get_office_preview_url"
+		url = "https://api.alipan.com/v2/file/get_office_preview_url"
 	case "video_preview":
-		url = "https://api.aliyundrive.com/v2/file/get_video_preview_play_info"
+		url = "https://api.alipan.com/v2/file/get_video_preview_play_info"
 		data["category"] = "live_transcoding"
 	default:
 		return nil, errs.NotSupport

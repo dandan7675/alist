@@ -2,10 +2,12 @@ package aliyundrive_open
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/Xhofe/rateg"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
@@ -17,12 +19,12 @@ import (
 type AliyundriveOpen struct {
 	model.Storage
 	Addition
-	base string
 
 	DriveId string
 
 	limitList func(ctx context.Context, data base.Json) (*Files, error)
 	limitLink func(ctx context.Context, file model.Obj) (*model.Link, error)
+	ref       *AliyundriveOpen
 }
 
 func (d *AliyundriveOpen) Config() driver.Config {
@@ -34,17 +36,39 @@ func (d *AliyundriveOpen) GetAddition() driver.Additional {
 }
 
 func (d *AliyundriveOpen) Init(ctx context.Context) error {
+	if d.LIVPDownloadFormat == "" {
+		d.LIVPDownloadFormat = "jpeg"
+	}
+	if d.DriveType == "" {
+		d.DriveType = "default"
+	}
 	res, err := d.request("/adrive/v1.0/user/getDriveInfo", http.MethodPost, nil)
 	if err != nil {
 		return err
 	}
-	d.DriveId = utils.Json.Get(res, "default_drive_id").ToString()
-	d.limitList = utils.LimitRateCtx(d.list, time.Second/4)
-	d.limitLink = utils.LimitRateCtx(d.link, time.Second)
+	d.DriveId = utils.Json.Get(res, d.DriveType+"_drive_id").ToString()
+	d.limitList = rateg.LimitFnCtx(d.list, rateg.LimitFnOption{
+		Limit:  4,
+		Bucket: 1,
+	})
+	d.limitLink = rateg.LimitFnCtx(d.link, rateg.LimitFnOption{
+		Limit:  1,
+		Bucket: 1,
+	})
 	return nil
 }
 
+func (d *AliyundriveOpen) InitReference(storage driver.Driver) error {
+	refStorage, ok := storage.(*AliyundriveOpen)
+	if ok {
+		d.ref = refStorage
+		return nil
+	}
+	return errs.NotSupport
+}
+
 func (d *AliyundriveOpen) Drop(ctx context.Context) error {
+	d.ref = nil
 	return nil
 }
 
@@ -73,7 +97,13 @@ func (d *AliyundriveOpen) link(ctx context.Context, file model.Obj) (*model.Link
 		return nil, err
 	}
 	url := utils.Json.Get(res, "url").ToString()
-	exp := time.Hour
+	if url == "" {
+		if utils.Ext(file.GetName()) != "livp" {
+			return nil, errors.New("get download url failed: " + string(res))
+		}
+		url = utils.Json.Get(res, "streamsUrl", d.LIVPDownloadFormat).ToString()
+	}
+	exp := time.Minute
 	return &model.Link{
 		URL:        url,
 		Expiration: &exp,
@@ -87,7 +117,9 @@ func (d *AliyundriveOpen) Link(ctx context.Context, file model.Obj, args model.L
 	return d.limitLink(ctx, file)
 }
 
-func (d *AliyundriveOpen) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+func (d *AliyundriveOpen) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
+	nowTime, _ := getNowTime()
+	newDir := File{CreatedAt: nowTime, UpdatedAt: nowTime}
 	_, err := d.request("/adrive/v1.0/openFile/create", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"drive_id":        d.DriveId,
@@ -95,12 +127,16 @@ func (d *AliyundriveOpen) MakeDir(ctx context.Context, parentDir model.Obj, dirN
 			"name":            dirName,
 			"type":            "folder",
 			"check_name_mode": "refuse",
-		})
+		}).SetResult(&newDir)
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return fileToObj(newDir), nil
 }
 
-func (d *AliyundriveOpen) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
+func (d *AliyundriveOpen) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
+	var resp MoveOrCopyResp
 	_, err := d.request("/adrive/v1.0/openFile/move", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"drive_id":          d.DriveId,
@@ -108,20 +144,36 @@ func (d *AliyundriveOpen) Move(ctx context.Context, srcObj, dstDir model.Obj) er
 			"to_parent_file_id": dstDir.GetID(),
 			"check_name_mode":   "refuse", // optional:ignore,auto_rename,refuse
 			//"new_name":          "newName", // The new name to use when a file of the same name exists
-		})
+		}).SetResult(&resp)
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	if resp.Exist {
+		return nil, errors.New("existence of files with the same name")
+	}
+
+	if srcObj, ok := srcObj.(*model.ObjThumb); ok {
+		srcObj.ID = resp.FileID
+		srcObj.Modified = time.Now()
+		return srcObj, nil
+	}
+	return nil, nil
 }
 
-func (d *AliyundriveOpen) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
+func (d *AliyundriveOpen) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
+	var newFile File
 	_, err := d.request("/adrive/v1.0/openFile/update", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"drive_id": d.DriveId,
 			"file_id":  srcObj.GetID(),
 			"name":     newName,
-		})
+		}).SetResult(&newFile)
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return fileToObj(newFile), nil
 }
 
 func (d *AliyundriveOpen) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
@@ -150,7 +202,7 @@ func (d *AliyundriveOpen) Remove(ctx context.Context, obj model.Obj) error {
 	return err
 }
 
-func (d *AliyundriveOpen) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *AliyundriveOpen) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	return d.upload(ctx, dstDir, stream, up)
 }
 
@@ -179,3 +231,7 @@ func (d *AliyundriveOpen) Other(ctx context.Context, args model.OtherArgs) (inte
 }
 
 var _ driver.Driver = (*AliyundriveOpen)(nil)
+var _ driver.MkdirResult = (*AliyundriveOpen)(nil)
+var _ driver.MoveResult = (*AliyundriveOpen)(nil)
+var _ driver.RenameResult = (*AliyundriveOpen)(nil)
+var _ driver.PutResult = (*AliyundriveOpen)(nil)

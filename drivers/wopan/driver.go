@@ -3,19 +3,21 @@ package template
 import (
 	"context"
 	"fmt"
+	"strconv"
 
-	"github.com/Xhofe/wopan-sdk-go"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
+	"github.com/xhofe/wopan-sdk-go"
 )
 
 type Wopan struct {
 	model.Storage
 	Addition
-	client *wopan.WoClient
+	client          *wopan.WoClient
+	defaultFamilyID string
 }
 
 func (d *Wopan) Config() driver.Config {
@@ -34,6 +36,11 @@ func (d *Wopan) Init(ctx context.Context) error {
 		d.RefreshToken = refreshToken
 		op.MustSaveDriverStorage(d)
 	})
+	fml, err := d.client.FamilyUserCurrentEncode()
+	if err != nil {
+		return err
+	}
+	d.defaultFamilyID = strconv.Itoa(fml.DefaultHomeId)
 	return d.client.InitData()
 }
 
@@ -81,7 +88,11 @@ func (d *Wopan) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (
 }
 
 func (d *Wopan) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
-	_, err := d.client.CreateDirectory(d.getSpaceType(), parentDir.GetID(), dirName, d.FamilyID, func(req *resty.Request) {
+	familyID := d.FamilyID
+	if familyID == "" {
+		familyID = d.defaultFamilyID
+	}
+	_, err := d.client.CreateDirectory(d.getSpaceType(), parentDir.GetID(), dirName, familyID, func(req *resty.Request) {
 		req.SetContext(ctx)
 	})
 	return err
@@ -148,8 +159,9 @@ func (d *Wopan) Put(ctx context.Context, dstDir model.Obj, stream model.FileStre
 		ContentType: stream.GetMimetype(),
 	}, dstDir.GetID(), d.FamilyID, wopan.Upload2COption{
 		OnProgress: func(current, total int64) {
-			up(int(100 * current / total))
+			up(100 * float64(current) / float64(total))
 		},
+		Ctx: ctx,
 	})
 	return err
 }
